@@ -1,38 +1,31 @@
 # RBAC Permission
 
-요구 사항
+[코드 예시](#코드-예시)
 
-1. 기본 권한 시스템
+## 요구사항
 
-   - Permission은 리소스별로 권한을 가짐
-   - Permission은 계층 구조를 가짐 (상위 권한이 하위 권한을 포함)
-   - 모든 접근 제어는 순수하게 Permission 기반으로 동작
+1. Permission 기반의 권한 관리 시스템
 
-2. 리소스 관리
+   - Role이 아닌 순수 Permission 기반으로 동작
+   - Permission 간의 계층 구조 지원 (상위 권한이 하위 권한을 포함)
 
-   - 각 리소스는 고유한 ID를 가짐 (Azure 스타일)
-   - 리소스 종류: workspace, platform accounts (youtube, tiktok, instagram), member 등
-   - 리소스 ID는 계층 구조를 가짐 (예: /workspaces/{id}/platforms/{platform}/accounts/{accountId})
+2. Resource 단위의 권한 관리
 
-3. Workspace 기반 구조
+   - 각 Resource는 고유 ID를 가짐 (Azure 스타일)
+   - Workspace 기반 멀티테넌시 지원
+   - Platform Account 연동 (YouTube, TikTok, Instagram)
 
-   - SaaS 시스템으로 여러 workspace 존재
-   - 각 workspace는 여러 platform account 보유 가능
-   - WorkspaceMember 테이블로 멤버 관리
+3. Workspace & Platform Account
 
-4. Platform Account 접근 제어
+   - 하나의 Workspace가 여러 플랫폼 계정 보유 가능
+   - 특정 플랫폼 계정에 대한 선별적 접근 권한 부여 가능
+   - 와일드카드를 통한 유연한 권한 관리 (예: "666\__", "_\_YOUTUBE")
 
-   - 특정 계정에만 접근 권한 부여 가능 (예: 666_YOUTUBE만 접근)
-   - 와일드카드 패턴 지원
-     - "666\_\*": 특정 계정의 모든 플랫폼
-     - "\*\_YOUTUBE": 모든 YouTube 계정
-     - "\_\_\_": 모든 계정
-   - Platform별로 세분화된 권한 관리 (read, write, manage)
+4. DB 구조
+   - WorkspaceMember 테이블에 권한 정보 저장
+   - Platform Account 정보 저장
 
-5. Permission 계층 구조
-   - System 레벨 권한 (system:admin, system:read_workspace 등)
-   - Workspace 레벨 권한 (workspace:admin, workspace:manage_member 등)
-   - Platform Account 레벨 권한 (platform_account:manage, write, read)
+## 코드 예시
 
 ```ts
 // Permission 정의
@@ -206,9 +199,55 @@ const hierarchyVisualization = visualizePermissionHierarchy(
 console.log("Permission Hierarchy:");
 console.log(hierarchyVisualization);
 
+//
+//
+//
+
+// 2. Resource Types & Platform Account IDs
+type ResourceType =
+  | "workspace"
+  | "youtube"
+  | "tiktok"
+  | "instagram"
+  | "member"
+  | "system";
+
+type PlatformAccountId = `${string}_${(typeof SYSTEM.PLATFORM_TYPES)[number]}`;
+type WildcardPattern =
+  | `${string}_${(typeof SYSTEM.PLATFORM_TYPES)[number] | "*"}`
+  | `${string | "*"}_${(typeof SYSTEM.PLATFORM_TYPES)[number]}`;
+
+// 3. DB Schema
+interface DBWorkspaceMember {
+  id: string;
+  workspaceId: string;
+  userId: string;
+  permissions: PermissionId[]; // 기본 권한 목록
+  platformPermissions: {
+    pattern: WildcardPattern;
+    permissions: PermissionId[];
+  }[];
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+interface DBPlatformAccount {
+  id: PlatformAccountId;
+  workspaceId: string;
+  platform: (typeof SYSTEM.PLATFORM_TYPES)[number];
+  accountId: string;
+  name: string;
+  accessToken: string;
+  refreshToken: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+// 4. Permission Manager
 class PermissionManager {
   constructor(private workspaceId: string) {}
 
+  // 권한 체크 (계층 구조 고려)
   private async hasImpliedPermission(
     permissions: PermissionId[],
     requiredPermission: PermissionId
@@ -221,6 +260,69 @@ class PermissionManager {
     });
   }
 
-  // ... 나머지 메서드들은 동일
+  // 와일드카드 패턴 매칭
+  private matchesPattern(
+    accountId: PlatformAccountId,
+    pattern: WildcardPattern
+  ): boolean {
+    if (pattern === "*_*") return true;
+
+    const [patternAccount, patternPlatform] = pattern.split("_");
+    const [targetAccount, targetPlatform] = accountId.split("_");
+
+    return (
+      (patternAccount === "*" || patternAccount === targetAccount) &&
+      (patternPlatform === "*" || patternPlatform === targetPlatform)
+    );
+  }
+
+  // 플랫폼 계정 접근 권한 체크
+  async checkPlatformAccountAccess(
+    memberId: string,
+    accountId: PlatformAccountId,
+    requiredPermission: PermissionId
+  ): Promise<boolean> {
+    const member = await this.findWorkspaceMember(memberId);
+
+    // workspace:admin 권한이 있다면 모든 플랫폼 접근 가능
+    if (await this.hasPermission(memberId, PERMISSIONS.WORKSPACE.ADMIN)) {
+      return true;
+    }
+
+    // 매칭되는 패턴에 대한 권한 확인
+    for (const perm of member.platformPermissions) {
+      if (this.matchesPattern(accountId, perm.pattern)) {
+        if (
+          await this.hasImpliedPermission(perm.permissions, requiredPermission)
+        ) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+}
+
+// 5. 사용 예시
+async function example() {
+  const permManager = new PermissionManager("ws_123");
+
+  // 특정 YouTube 계정만 접근 허용
+  const canAccessYoutube = await permManager.checkPlatformAccountAccess(
+    "user_789",
+    "666_YOUTUBE",
+    PERMISSIONS.PLATFORM_ACCOUNT.READ
+  );
+
+  // 특정 계정의 모든 플랫폼 접근 허용
+  const member = {
+    platformPermissions: [
+      {
+        pattern: "666_*",
+        permissions: [PERMISSIONS.PLATFORM_ACCOUNT.READ],
+      },
+    ],
+  };
 }
 ```

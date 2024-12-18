@@ -2,7 +2,7 @@
 
 ## 체계
 
-- [개발 체계](/develop.md)
+- [개발 체계](/develop/develop_standard.md)
 
 ## 아직 미완입니다
 
